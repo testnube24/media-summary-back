@@ -1,0 +1,16 @@
+com\mediasummary\service\EmailService.class
+com\mediasummary\config\SupabaseConfig.class
+com\mediasummary\model\Job.class
+com\mediasummary\service\ObjectStorageService.class
+com\mediasummary\config\AsyncConfig.class
+com\mediasummary\controller\JobController.class
+com\mediasummary\service\JobService$Summaries.class
+com\mediasummary\service\JobService.class
+com\mediasummary\service\ObjectStorageService$StoredObject.class
+com\mediasummary\service\JobQueueService$QueueMessage.class
+com\mediasummary\repository\JobRepository.class
+com\mediasummary\MediaSummaryApplication.class
+com\mediasummary\service\JobWorker.class
+com\mediasummary\model\Job$JobBuilder.class
+com\mediasummary\service\JobQueueService.class
+com\mediasummary\service\SupabaseStorageService.class

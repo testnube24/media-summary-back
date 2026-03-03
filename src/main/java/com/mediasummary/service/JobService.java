@@ -1,0 +1,380 @@
+package com.mediasummary.service;
+
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.mediasummary.model.Job;
+import com.mediasummary.repository.JobRepository;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JobService {
+
+    private final JobRepository jobRepository;
+    private final EmailService emailService;
+
+    @Value("${assemblyai.api.key}")
+    private String assemblyAiKey;
+
+    @Value("${assemblyai.poll.attempts:60}")
+    private int assemblyAiPollAttempts;
+
+    @Value("${assemblyai.poll.delay.ms:1000}")
+    private long assemblyAiPollDelayMs;
+
+    @Value("${assemblyai.poll.backoff.factor:1.5}")
+    private double assemblyAiPollBackoffFactor;
+
+    @Value("${assemblyai.speech.models:universal-3-pro}")
+    private String assemblyAiSpeechModels;
+
+    @Value("${assemblyai.webhook.url:}")
+    private String assemblyAiWebhookUrl;
+
+    @Value("${groq.api.key}")
+    private String groqApiKey;
+
+    @Value("${groq.api.url}")
+    private String groqApiUrl;
+
+    private final OkHttpClient client = new OkHttpClient.Builder()
+            .connectTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .build();
+
+    private final Gson gson = new Gson();
+
+    public Job createJob(Job job) {
+        if (job.getStatus() == null) job.setStatus("QUEUED");
+        if (job.getCreatedAt() == null) job.setCreatedAt(LocalDateTime.now());
+        if (job.getProgressPercent() == null) job.setProgressPercent(0);
+        if (job.getStatusDetail() == null) job.setStatusDetail("queued");
+
+        Long jobId = jobRepository.save(job);
+        job.setId(jobId);
+        log.info("Job created: {} for email: {}", jobId, job.getEmail());
+        return job;
+    }
+
+    public void processJob(Long jobId) {
+        long startTime = System.currentTimeMillis();
+
+        try {
+            Job existing = jobRepository.findById(jobId);
+            if (existing == null) {
+                log.warn("Job {} not found in DB", jobId);
+                return;
+            }
+
+            if ("COMPLETED".equalsIgnoreCase(existing.getStatus())) {
+                log.info("Job {} already completed; skipping", jobId);
+                return;
+            }
+
+            if (existing.getAudioUrl() == null || existing.getAudioUrl().isBlank()) {
+                throw new IllegalStateException("Job has no shared audio URL");
+            }
+
+            jobRepository.updateStatus(jobId, "PROCESSING", null);
+            jobRepository.updateProgress(jobId, 10, "transcribing");
+
+            String transcription = transcribeWithAssemblyAI(jobId, existing.getAudioUrl());
+            if (transcription == null || transcription.isBlank()) {
+                log.info("Transcription still pending for job {}. Keeping PROCESSING.", jobId);
+                return;
+            }
+
+            jobRepository.updateProgress(jobId, 75, "summarizing");
+            Summaries summaries = generateSummaries(transcription);
+
+            int processingTime = (int) (System.currentTimeMillis() - startTime);
+            jobRepository.updateCompleted(jobId, "COMPLETED", summaries.getMiniSummary(), processingTime);
+            jobRepository.updateProgress(jobId, 100, "completed");
+
+            Job completedJob = jobRepository.findById(jobId);
+            emailService.sendSummaryEmail(completedJob, summaries.getEmailSummary());
+            log.info("Job {} completed in {}ms", jobId, processingTime);
+        } catch (Exception e) {
+            log.error("Error processing job {}", jobId, e);
+            jobRepository.updateStatus(jobId, "ERROR", e.getMessage());
+            Job failedJob = jobRepository.findById(jobId);
+            if (failedJob != null) {
+                emailService.sendErrorEmail(failedJob.getEmail(), e.getMessage());
+            }
+        }
+    }
+
+    public Job getJobStatus(Long jobId) {
+        return jobRepository.findById(jobId);
+    }
+
+    public List<Job> getAllJobs() {
+        return jobRepository.getAll();
+    }
+
+    private String transcribeWithAssemblyAI(Long jobId, String audioUrl) throws IOException {
+        JsonObject transcriptReq = new JsonObject();
+        transcriptReq.addProperty("audio_url", audioUrl);
+
+        com.google.gson.JsonArray modelsArray = new com.google.gson.JsonArray();
+        for (String m : assemblyAiSpeechModels.split(",")) {
+            String mm = m.trim();
+            if (!mm.isEmpty()) modelsArray.add(mm);
+        }
+        transcriptReq.add("speech_models", modelsArray);
+
+        if (assemblyAiWebhookUrl != null && !assemblyAiWebhookUrl.isBlank()) {
+            transcriptReq.addProperty("webhook_url", assemblyAiWebhookUrl);
+        }
+
+        String json = gson.toJson(transcriptReq);
+        RequestBody transcriptBody = RequestBody.create(json, MediaType.parse("application/json"));
+
+        Request transcriptRequest = new Request.Builder()
+                .url("https://api.assemblyai.com/v2/transcript")
+                .header("authorization", assemblyAiKey)
+                .header("content-type", "application/json")
+                .post(transcriptBody)
+                .build();
+
+        try (Response response = client.newCall(transcriptRequest).execute()) {
+            String body = response.body() != null ? response.body().string() : null;
+            JsonObject obj = gson.fromJson(body, JsonObject.class);
+            String transcriptId = obj != null && obj.has("id") ? obj.get("id").getAsString() : null;
+
+            if (transcriptId == null) {
+                throw new IOException("Transcript creation failed: " + body);
+            }
+
+            jobRepository.updateAudioAndTranscript(jobId, audioUrl, transcriptId);
+            return pollTranscriptionResult(transcriptId);
+        }
+    }
+
+    public void handleAssemblyAiWebhook(java.util.Map<String, Object> payload) {
+        try {
+            if (payload == null) {
+                log.warn("Received empty webhook payload");
+                return;
+            }
+
+            String transcriptId = payload.get("id") != null ? payload.get("id").toString() : null;
+            String status = payload.get("status") != null ? payload.get("status").toString() : null;
+
+            if (transcriptId == null) {
+                log.warn("Webhook missing transcript id");
+                return;
+            }
+
+            Job job = jobRepository.findByTranscriptId(transcriptId);
+            if (job == null) {
+                log.warn("No job found for transcript id {}", transcriptId);
+                return;
+            }
+
+            if ("completed".equalsIgnoreCase(status)) {
+                String text = payload.get("text") != null ? payload.get("text").toString() : null;
+                if (text == null || text.isBlank()) {
+                    text = fetchTranscriptText(transcriptId);
+                }
+
+                if (text == null || text.isBlank()) {
+                    jobRepository.updateStatus(job.getId(), "ERROR", "No transcript text available");
+                    return;
+                }
+
+                Summaries summaries = generateSummaries(text);
+                int processingTime = 0;
+                if (job.getCreatedAt() != null) {
+                    processingTime = (int) java.time.Duration.between(job.getCreatedAt(), LocalDateTime.now()).toMillis();
+                }
+
+                jobRepository.updateCompleted(job.getId(), "COMPLETED", summaries.getMiniSummary(), processingTime);
+                jobRepository.updateProgress(job.getId(), 100, "completed");
+                emailService.sendSummaryEmail(jobRepository.findById(job.getId()), summaries.getEmailSummary());
+            } else if ("error".equalsIgnoreCase(status)) {
+                String msg = payload.get("error") != null ? payload.get("error").toString() : "AssemblyAI reported error";
+                jobRepository.updateStatus(job.getId(), "ERROR", msg);
+                emailService.sendErrorEmail(job.getEmail(), msg);
+            } else {
+                jobRepository.updateProgress(job.getId(), 30, status != null ? status : "processing");
+            }
+        } catch (Exception e) {
+            log.error("Unhandled exception processing assemblyai webhook", e);
+        }
+    }
+
+    private String fetchTranscriptText(String transcriptId) {
+        try {
+            Request req = new Request.Builder()
+                    .url("https://api.assemblyai.com/v2/transcript/" + transcriptId)
+                    .header("authorization", assemblyAiKey)
+                    .build();
+
+            try (Response resp = client.newCall(req).execute()) {
+                String body = resp.body() != null ? resp.body().string() : null;
+                JsonObject obj = gson.fromJson(body, JsonObject.class);
+                if (obj != null && obj.has("text") && !obj.get("text").isJsonNull()) {
+                    return obj.get("text").getAsString();
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to fetch transcript {}: {}", transcriptId, e.getMessage());
+        }
+        return null;
+    }
+
+    private Summaries generateSummaries(String transcription) throws IOException {
+        String prompt = "Analiza este texto y genera DOS resumenes en espanol, separados por [SEPARATOR]. " +
+                "No uses ingles. Usa un tono profesional y claro.\n\n" +
+                "SHORT_SUMMARY: Maximo 50 palabras en espanol, resumen ejecutivo para vista previa.\n" +
+                "LONG_SUMMARY: 250-300 palabras en espanol, resumen profesional detallado para email.\n\n" +
+                "Texto: " + transcription.substring(0, Math.min(transcription.length(), 3000));
+
+        JsonObject req = new JsonObject();
+        req.addProperty("model", "llama-3.1-8b-instant");
+
+        com.google.gson.JsonArray messages = new com.google.gson.JsonArray();
+        JsonObject m = new JsonObject();
+        m.addProperty("role", "user");
+        m.addProperty("content", prompt);
+        messages.add(m);
+        req.add("messages", messages);
+
+        req.addProperty("temperature", 0.3);
+        req.addProperty("max_tokens", 800);
+
+        RequestBody body = RequestBody.create(gson.toJson(req), MediaType.parse("application/json"));
+        Request request = new Request.Builder()
+                .url(groqApiUrl)
+                .header("Authorization", "Bearer " + groqApiKey)
+                .header("Content-Type", "application/json")
+                .post(body)
+                .build();
+
+        try (Response response = client.newCall(request).execute()) {
+            String responseBody = response.body() != null ? response.body().string() : null;
+            if (!response.isSuccessful()) {
+                throw new IOException("Groq API error: " + response.code() + " body: " + responseBody);
+            }
+            return parseSummaries(responseBody);
+        }
+    }
+
+    private Summaries parseSummaries(String groqResponse) {
+        String content = extractContent(groqResponse);
+        String[] parts = content.split("\\[SEPARATOR\\]|SHORT_SUMMARY:|LONG_SUMMARY:");
+
+        String miniSummary;
+        String emailSummary;
+
+        if (parts.length >= 2) {
+            String shortPart = parts[1].trim();
+            miniSummary = shortPart.substring(0, Math.min(500, shortPart.length()));
+            emailSummary = parts.length > 2 ? parts[2].trim() : shortPart;
+        } else {
+            String[] sentences = content.split("\\. ");
+            StringBuilder mini = new StringBuilder();
+            for (int i = 0; i < Math.min(2, sentences.length); i++) {
+                mini.append(sentences[i]).append(". ");
+            }
+            String miniStr = mini.toString().trim();
+            miniSummary = miniStr.substring(0, Math.min(500, miniStr.length()));
+            emailSummary = content;
+        }
+
+        return new Summaries(miniSummary, emailSummary);
+    }
+
+    private String pollTranscriptionResult(String transcriptId) throws IOException {
+        long delay = assemblyAiPollDelayMs;
+        for (int attempt = 1; attempt <= assemblyAiPollAttempts; attempt++) {
+            Request request = new Request.Builder()
+                    .url("https://api.assemblyai.com/v2/transcript/" + transcriptId)
+                    .header("authorization", assemblyAiKey)
+                    .build();
+
+            try (Response response = client.newCall(request).execute()) {
+                String body = response.body() != null ? response.body().string() : null;
+                if (body != null) {
+                    JsonObject obj = gson.fromJson(body, JsonObject.class);
+                    String status = obj != null && obj.has("status") && !obj.get("status").isJsonNull()
+                            ? obj.get("status").getAsString()
+                            : null;
+
+                    if ("completed".equalsIgnoreCase(status)) {
+                        Job j = jobRepository.findByTranscriptId(transcriptId);
+                        if (j != null) jobRepository.updateProgress(j.getId(), 100, "completed");
+                        return parseTranscriptionText(body);
+                    }
+
+                    if ("error".equalsIgnoreCase(status)) {
+                        String err = obj.has("error") && !obj.get("error").isJsonNull()
+                                ? obj.get("error").getAsString()
+                                : "AssemblyAI reported error";
+                        throw new IOException("Transcription failed: " + err);
+                    }
+
+                    if ("queued".equalsIgnoreCase(status) || "processing".equalsIgnoreCase(status)) {
+                        int approx = Math.min(99, Math.max(1, (int) ((attempt / (double) assemblyAiPollAttempts) * 100)));
+                        Job j = jobRepository.findByTranscriptId(transcriptId);
+                        if (j != null) jobRepository.updateProgress(j.getId(), approx, status);
+                    }
+                }
+            } catch (IOException e) {
+                log.warn("Error polling AssemblyAI (attempt {}/{}): {}", attempt, assemblyAiPollAttempts, e.getMessage());
+            }
+
+            if (attempt == assemblyAiPollAttempts) break;
+
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Transcription polling interrupted", e);
+            }
+            delay = Math.min((long) (delay * assemblyAiPollBackoffFactor), 30000L);
+        }
+
+        log.warn("Transcription polling timeout after {} attempts for transcript {}", assemblyAiPollAttempts, transcriptId);
+        return null;
+    }
+
+    private String parseTranscriptionText(String json) {
+        try {
+            JsonObject obj = gson.fromJson(json, JsonObject.class);
+            return obj.has("text") ? obj.get("text").getAsString() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String extractContent(String json) {
+        int start = json.indexOf("\"content\":\"") + 11;
+        int end = json.indexOf("\"", start);
+        return json.substring(start, end).replace("\\n", "\n").replace("\\\"", "\"");
+    }
+
+    @lombok.AllArgsConstructor
+    @lombok.Getter
+    private static class Summaries {
+        private final String miniSummary;
+        private final String emailSummary;
+    }
+}

@@ -1,0 +1,96 @@
+version: "3.9"
+
+x-backend-env: &backend-env
+  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-audiosummary}
+  SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-postgres}
+  SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+  REDIS_SSL: "false"
+  APP_QUEUE_STREAM_KEY: ${APP_QUEUE_STREAM_KEY:-audio:jobs}
+  APP_QUEUE_CONSUMER_GROUP: ${APP_QUEUE_CONSUMER_GROUP:-audio-workers}
+  APP_CORS_ALLOWED_ORIGINS: ${APP_CORS_ALLOWED_ORIGINS:-*}
+  APP_MAX_FILE_SIZE: ${APP_MAX_FILE_SIZE:-50MB}
+  APP_MAX_REQUEST_SIZE: ${APP_MAX_REQUEST_SIZE:-50MB}
+
+  ASSEMBLYAI_API_KEY: ${ASSEMBLYAI_API_KEY:-}
+  ASSEMBLYAI_WEBHOOK_URL: ${ASSEMBLYAI_WEBHOOK_URL:-}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  GROQ_API_URL: ${GROQ_API_URL:-https://api.groq.com/openai/v1/chat/completions}
+
+  SUPABASE_URL: ${SUPABASE_URL:-}
+  SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
+  SUPABASE_STORAGE_BUCKET: ${SUPABASE_STORAGE_BUCKET:-audio-files}
+  SUPABASE_STORAGE_PUBLIC_BASE_URL: ${SUPABASE_STORAGE_PUBLIC_BASE_URL:-}
+
+  SPRING_MAIL_HOST: ${SPRING_MAIL_HOST:-sandbox.smtp.mailtrap.io}
+  SPRING_MAIL_PORT: ${SPRING_MAIL_PORT:-2525}
+  SPRING_MAIL_USERNAME: ${SPRING_MAIL_USERNAME:-}
+  SPRING_MAIL_PASSWORD: ${SPRING_MAIL_PASSWORD:-}
+  SPRING_MAIL_SMTP_AUTH: ${SPRING_MAIL_SMTP_AUTH:-true}
+  SPRING_MAIL_SMTP_STARTTLS: ${SPRING_MAIL_SMTP_STARTTLS:-true}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-audiosummary}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-audiosummary}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      <<: *backend-env
+      APP_WORKER_ENABLED: "false"
+      PORT: 8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      <<: *backend-env
+      APP_WORKER_ENABLED: "true"
+      APP_QUEUE_CONSUMER_NAME: ${APP_QUEUE_CONSUMER_NAME:-worker-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
