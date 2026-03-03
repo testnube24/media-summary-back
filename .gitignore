@@ -1,0 +1,22 @@
+# Build outputs
+target/
+
+# Runtime/temp artifacts
+temp-tomcat/
+uploads/
+*.log
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE (Eclipse/STS)
+.classpath
+.project
+.factorypath
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
