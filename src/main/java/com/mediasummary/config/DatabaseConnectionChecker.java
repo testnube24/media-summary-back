@@ -17,24 +17,21 @@ public class DatabaseConnectionChecker {
         this.jdbcTemplate = jdbcTemplate;
     }
 
-    /**
-     * Runs at application startup and validates DB connectivity by running a lightweight query.
-     * Logs success or failure. To fail the application startup on DB errors, rethrow the exception.
-     */
     @Bean
     public ApplicationRunner validateDatabaseConnection() {
         return args -> {
-            try {
+            try (var conn = jdbcTemplate.getDataSource().getConnection()) {
                 Integer result = jdbcTemplate.queryForObject("SELECT 1", Integer.class);
+
                 if (result != null && result == 1) {
-                    log.info("Database connection validated at startup (SELECT 1 returned 1).");
+                    log.info("Database connected successfully.");
                 } else {
-                    log.warn("Database validation returned unexpected result: {}", result);
+                    log.warn("Database connection validation returned unexpected result: {}", result);
                 }
+
             } catch (Exception e) {
-                log.error("Failed to connect to the database on startup:", e);
-                // If you want the app to fail fast when the DB is unreachable, uncomment the next line:
-                // throw e;
+                log.error("Database connection failed: {}", e.getMessage());
+                throw e;
             }
         };
     }

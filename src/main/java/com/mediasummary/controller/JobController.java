@@ -8,6 +8,7 @@ import java.util.Set;
 import javax.validation.constraints.Email;
 import javax.validation.constraints.NotBlank;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
@@ -26,8 +27,12 @@ import com.mediasummary.service.JobService;
 import com.mediasummary.service.ObjectStorageService;
 import com.mediasummary.service.ObjectStorageService.StoredObject;
 
+import com.zaxxer.hikari.HikariDataSource;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.jdbc.core.JdbcTemplate;
 
 @RestController
 @RequestMapping("/v1/jobs")
@@ -44,6 +49,10 @@ public class JobController {
     private final JobService jobService;
     private final JobQueueService queueService;
     private final ObjectStorageService objectStorageService;
+    private final JdbcTemplate jdbcTemplate;
+
+    @Value("${app.max-file-size:52428800}")
+    private long maxFileSizeBytes;
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<Map<String, Object>> uploadAudio(
@@ -53,6 +62,13 @@ public class JobController {
         if (file == null || file.isEmpty()) {
             return ResponseEntity.badRequest().body(Map.of("error", "Archivo vacio"));
         }
+
+        if (file.getSize() > maxFileSizeBytes) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "error",
+                    "Archivo demasiado grande. Máximo " + (maxFileSizeBytes / (1024 * 1024)) + "MB permitidos."));
+        }
+
         if (!isSupportedByAssemblyAi(file)) {
             return ResponseEntity.badRequest().body(Map.of(
                     "error",
@@ -60,7 +76,11 @@ public class JobController {
         }
 
         try {
+            log.info("Received upload request. File: {}, Size: {} bytes, Email: {}", 
+                file.getOriginalFilename(), file.getSize(), email);
+            
             StoredObject storedObject = objectStorageService.uploadAudio(file);
+            log.info("File uploaded to storage. Public URL: {}", storedObject.getPublicUrl());
 
             Job job = Job.builder()
                     .email(email)
@@ -71,7 +91,10 @@ public class JobController {
                     .build();
 
             job = jobService.createJob(job);
+            log.info("Job {} created in database", job.getId());
+
             queueService.enqueueJob(job.getId());
+            log.info("Job {} enqueued to Redis", job.getId());
 
             Map<String, Object> response = new HashMap<>();
             response.put("jobId", job.getId());
@@ -81,8 +104,10 @@ public class JobController {
 
             return ResponseEntity.accepted().body(response);
         } catch (Exception e) {
-            log.error("Error creating queued job", e);
-            return ResponseEntity.status(500).body(Map.of("error", "No se pudo encolar el trabajo"));
+            log.error("Error creating queued job. File: {}, Email: {}, Error: {}", 
+                file != null ? file.getOriginalFilename() : "null",
+                email, e.getMessage(), e);
+            return ResponseEntity.status(500).body(Map.of("error", "No se pudo encolar el trabajo: " + e.getMessage()));
         }
     }
 
@@ -123,6 +148,26 @@ public class JobController {
     @GetMapping("/health")
     public ResponseEntity<String> health() {
         return ResponseEntity.ok("OK");
+    }
+
+    @GetMapping("/pool")
+    public ResponseEntity<?> poolStatus() {
+        var ds = jdbcTemplate.getDataSource();
+        if (ds instanceof HikariDataSource) {
+            HikariDataSource hikari = (HikariDataSource) ds;
+            var config = hikari.getHikariConfigMXBean();
+            var metrics = hikari.getHikariPoolMXBean();
+            Map<String, Object> result = new HashMap<>();
+            result.put("poolName", hikari.getPoolName());
+            result.put("maximumPoolSize", config.getMaximumPoolSize());
+            result.put("minimumIdle", config.getMinimumIdle());
+            result.put("activeConnections", metrics.getActiveConnections());
+            result.put("idleConnections", metrics.getIdleConnections());
+            result.put("totalConnections", metrics.getTotalConnections());
+            result.put("threadsAwaitingConnection", metrics.getThreadsAwaitingConnection());
+            return ResponseEntity.ok(result);
+        }
+        return ResponseEntity.ok("Not using HikariCP");
     }
 
     @PostMapping("/webhook")

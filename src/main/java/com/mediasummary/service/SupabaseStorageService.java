@@ -2,10 +2,12 @@ package com.mediasummary.service;
 
 import java.io.IOException;
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.Locale;
 import java.util.UUID;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -34,6 +36,9 @@ public class SupabaseStorageService implements ObjectStorageService {
     @Value("${supabase.storage.public.base-url:}")
     private String publicBaseUrl;
 
+    @Value("${app.cleanup.days:7}")
+    private int cleanupDays;
+
     @Override
     public StoredObject uploadAudio(MultipartFile file) {
         try {
@@ -61,15 +66,16 @@ public class SupabaseStorageService implements ObjectStorageService {
             try (Response response = client.newCall(request).execute()) {
                 if (!response.isSuccessful()) {
                     String body = response.body() != null ? response.body().string() : "";
+                    log.error("Supabase upload failed. HTTP {} - {}", response.code(), body);
                     throw new IOException("Supabase upload failed: " + response.code() + " - " + body);
                 }
             }
 
             String publicUrl = buildPublicUrl(objectPath);
-            log.info("Uploaded object to Supabase Storage path={} url={}", objectPath, publicUrl);
+            log.info("Successfully uploaded file to Supabase. path={}", objectPath);
             return new StoredObject(objectPath, publicUrl);
         } catch (Exception e) {
-            log.error("Error uploading file to Supabase Storage", e);
+            log.error("Failed to upload file to Supabase Storage - {}", e.getMessage());
             throw new RuntimeException("Could not upload file to shared storage", e);
         }
     }
@@ -93,6 +99,84 @@ public class SupabaseStorageService implements ObjectStorageService {
     private String trimTrailingSlash(String value) {
         if (value == null) return "";
         return value.endsWith("/") ? value.substring(0, value.length() - 1) : value;
+    }
+
+    @Scheduled(cron = "${app.cleanup.cron:0 0 3 * * ?}")
+    public void cleanupOldFiles() {
+        log.info("Starting cleanup of files older than {} days", cleanupDays);
+        
+        LocalDate cutoffDate = LocalDate.now().minusDays(cleanupDays);
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+        
+        int deletedCount = 0;
+        
+        for (int i = 0; i < cleanupDays; i++) {
+            LocalDate dateToCheck = cutoffDate.minusDays(i);
+            String dateStr = dateToCheck.format(formatter);
+            
+            try {
+                String listUrl = String.format("%s/storage/v1/object/list/%s", 
+                    trimTrailingSlash(supabaseUrl), bucket);
+                
+                String jsonBody = String.format("{\"prefix\":\"uploads/%s/\"}", dateStr);
+                
+                Request listRequest = new Request.Builder()
+                        .url(listUrl)
+                        .header("Authorization", "Bearer " + supabaseServiceKey)
+                        .header("apikey", supabaseServiceKey)
+                        .post(RequestBody.create(jsonBody, MediaType.parse("application/json")))
+                        .build();
+                
+                try (Response listResponse = client.newCall(listRequest).execute()) {
+                    if (listResponse.isSuccessful() && listResponse.body() != null) {
+                        String responseBody = listResponse.body().string();
+                        
+                        if (responseBody.contains("\"name\"")) {
+                            String[] names = responseBody.split("\"name\":\"");
+                            for (int j = 1; j < names.length; j++) {
+                                String namePart = names[j];
+                                String objectName = namePart.split("\"")[0];
+                                String objectPath = "uploads/" + dateStr + "/" + objectName;
+                                
+                                if (deleteObject(objectPath)) {
+                                    deletedCount++;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Error checking/cleaning files for date {}: {}", dateStr, e.getMessage());
+            }
+        }
+        
+        log.info("Cleanup completed. Deleted {} files older than {} days", deletedCount, cleanupDays);
+    }
+
+    private boolean deleteObject(String objectPath) {
+        try {
+            String deleteUrl = String.format("%s/storage/v1/object/%s/%s", 
+                trimTrailingSlash(supabaseUrl), bucket, objectPath);
+            
+            Request deleteRequest = new Request.Builder()
+                    .url(deleteUrl)
+                    .header("Authorization", "Bearer " + supabaseServiceKey)
+                    .header("apikey", supabaseServiceKey)
+                    .delete()
+                    .build();
+            
+            try (Response response = client.newCall(deleteRequest).execute()) {
+                if (response.isSuccessful()) {
+                    log.info("Deleted old file: {}", objectPath);
+                    return true;
+                } else {
+                    log.warn("Failed to delete {}: {}", objectPath, response.code());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Error deleting object {}: {}", objectPath, e.getMessage());
+        }
+        return false;
     }
 }
 

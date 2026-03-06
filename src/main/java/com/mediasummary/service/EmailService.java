@@ -36,10 +36,10 @@ public class EmailService {
             helper.setText(html, true);
 
             mailSender.send(message);
-            log.info("Email enviado a: {}", job.getEmail());
+            log.info("Job {}: Summary email sent successfully to {}", job.getId(), job.getEmail());
 
-        } catch (MessagingException e) {
-            log.error("Error enviando email: ", e);
+        } catch (Exception e) {
+            log.error("Job {}: Failed to send summary email to {} - {}", job.getId(), job.getEmail(), e.getMessage());
         }
     }
 
@@ -58,9 +58,10 @@ public class EmailService {
 
             helper.setText(html, true);
             mailSender.send(message);
+            log.info("Error email sent to {}", email);
 
-        } catch (MessagingException e) {
-            log.error("Error enviando email de error: ", e);
+        } catch (Exception e) {
+            log.error("Failed to send error email to {} - {}", email, e.getMessage());
         }
     }
 

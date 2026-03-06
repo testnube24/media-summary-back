@@ -5,7 +5,9 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
-import org.springframework.jdbc.datasource.DriverManagerDataSource;
+
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 
 import javax.sql.DataSource;
 
@@ -21,14 +23,35 @@ public class SupabaseConfig {
     @Value("${spring.datasource.password}")
     private String dbPassword;
 
+    @Value("${DB_POOL_MAX:20}")
+    private int maxPoolSize;
+
+    @Value("${DB_POOL_MIN:5}")
+    private int minIdle;
+
+    @Value("${DB_POOL_TIMEOUT:30000}")
+    private long connectionTimeout;
+
+    @Value("${DB_POOL_IDLE:600000}")
+    private long idleTimeout;
+
+    @Value("${DB_POOL_MAX_LIFE:1800000}")
+    private long maxLifetime;
+
     @Bean
     public DataSource dataSource() {
-        DriverManagerDataSource dataSource = new DriverManagerDataSource();
-        dataSource.setDriverClassName("org.postgresql.Driver");
-        dataSource.setUrl(dbUrl);
-        dataSource.setUsername(dbUser);
-        dataSource.setPassword(dbPassword);
-        return dataSource;
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(dbUrl);
+        config.setUsername(dbUser);
+        config.setPassword(dbPassword);
+        config.setDriverClassName("org.postgresql.Driver");
+        config.setMaximumPoolSize(maxPoolSize);
+        config.setMinimumIdle(minIdle);
+        config.setConnectionTimeout(connectionTimeout);
+        config.setIdleTimeout(idleTimeout);
+        config.setMaxLifetime(maxLifetime);
+        config.setPoolName("HikariPool-MediaSummary");
+        return new HikariDataSource(config);
     }
 
     @Bean

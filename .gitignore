@@ -10,6 +10,7 @@ uploads/
 .env
 .env.*
 !.env.example
+application-local.properties
 
 # IDE (Eclipse/STS)
 .classpath

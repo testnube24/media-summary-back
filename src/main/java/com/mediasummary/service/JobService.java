@@ -129,6 +129,8 @@ public class JobService {
     }
 
     private String transcribeWithAssemblyAI(Long jobId, String audioUrl) throws IOException {
+        log.info("Job {}: Starting transcription with AssemblyAI", jobId);
+        
         JsonObject transcriptReq = new JsonObject();
         transcriptReq.addProperty("audio_url", audioUrl);
 
@@ -155,15 +157,26 @@ public class JobService {
 
         try (Response response = client.newCall(transcriptRequest).execute()) {
             String body = response.body() != null ? response.body().string() : null;
+            
+            if (!response.isSuccessful()) {
+                log.error("Job {}: AssemblyAI transcript creation failed. HTTP {}", jobId, response.code());
+                throw new IOException("AssemblyAI transcript creation failed: " + response.code() + " body: " + body);
+            }
+            
             JsonObject obj = gson.fromJson(body, JsonObject.class);
             String transcriptId = obj != null && obj.has("id") ? obj.get("id").getAsString() : null;
 
             if (transcriptId == null) {
+                log.error("Job {}: AssemblyAI response missing transcript ID", jobId);
                 throw new IOException("Transcript creation failed: " + body);
             }
 
+            log.info("Job {}: Transcription submitted to AssemblyAI, transcriptId={}", jobId, transcriptId);
             jobRepository.updateAudioAndTranscript(jobId, audioUrl, transcriptId);
-            return pollTranscriptionResult(transcriptId);
+            return pollTranscriptionResult(jobId, transcriptId);
+        } catch (IOException e) {
+            log.error("Job {}: Failed to connect to AssemblyAI - {}", jobId, e.getMessage());
+            throw e;
         }
     }
 
@@ -241,6 +254,8 @@ public class JobService {
     }
 
     private Summaries generateSummaries(String transcription) throws IOException {
+        log.info("Generating summaries with Groq API");
+        
         String prompt = "Analiza este texto y genera DOS resumenes en espanol, separados por [SEPARATOR]. " +
                 "No uses ingles. Usa un tono profesional y claro.\n\n" +
                 "SHORT_SUMMARY: Maximo 50 palabras en espanol, resumen ejecutivo para vista previa.\n" +
@@ -271,9 +286,14 @@ public class JobService {
         try (Response response = client.newCall(request).execute()) {
             String responseBody = response.body() != null ? response.body().string() : null;
             if (!response.isSuccessful()) {
+                log.error("Groq API request failed. HTTP {} - {}", response.code(), responseBody);
                 throw new IOException("Groq API error: " + response.code() + " body: " + responseBody);
             }
+            log.info("Groq API request successful");
             return parseSummaries(responseBody);
+        } catch (IOException e) {
+            log.error("Failed to connect to Groq API - {}", e.getMessage());
+            throw e;
         }
     }
 
@@ -302,7 +322,8 @@ public class JobService {
         return new Summaries(miniSummary, emailSummary);
     }
 
-    private String pollTranscriptionResult(String transcriptId) throws IOException {
+    private String pollTranscriptionResult(Long jobId, String transcriptId) throws IOException {
+        log.info("Job {}: Starting transcription polling for transcriptId={}", jobId, transcriptId);
         long delay = assemblyAiPollDelayMs;
         for (int attempt = 1; attempt <= assemblyAiPollAttempts; attempt++) {
             Request request = new Request.Builder()
@@ -319,6 +340,7 @@ public class JobService {
                             : null;
 
                     if ("completed".equalsIgnoreCase(status)) {
+                        log.info("Job {}: AssemblyAI transcription completed", jobId);
                         Job j = jobRepository.findByTranscriptId(transcriptId);
                         if (j != null) jobRepository.updateProgress(j.getId(), 100, "completed");
                         return parseTranscriptionText(body);
@@ -328,17 +350,19 @@ public class JobService {
                         String err = obj.has("error") && !obj.get("error").isJsonNull()
                                 ? obj.get("error").getAsString()
                                 : "AssemblyAI reported error";
+                        log.error("Job {}: AssemblyAI transcription failed - {}", jobId, err);
                         throw new IOException("Transcription failed: " + err);
                     }
 
                     if ("queued".equalsIgnoreCase(status) || "processing".equalsIgnoreCase(status)) {
+                        log.debug("Job {}: AssemblyAI status={} (attempt {}/{})", jobId, status, attempt, assemblyAiPollAttempts);
                         int approx = Math.min(99, Math.max(1, (int) ((attempt / (double) assemblyAiPollAttempts) * 100)));
                         Job j = jobRepository.findByTranscriptId(transcriptId);
                         if (j != null) jobRepository.updateProgress(j.getId(), approx, status);
                     }
                 }
             } catch (IOException e) {
-                log.warn("Error polling AssemblyAI (attempt {}/{}): {}", attempt, assemblyAiPollAttempts, e.getMessage());
+                log.warn("Job {}: Error polling AssemblyAI (attempt {}/{}) - {}", jobId, attempt, assemblyAiPollAttempts, e.getMessage());
             }
 
             if (attempt == assemblyAiPollAttempts) break;
@@ -352,7 +376,7 @@ public class JobService {
             delay = Math.min((long) (delay * assemblyAiPollBackoffFactor), 30000L);
         }
 
-        log.warn("Transcription polling timeout after {} attempts for transcript {}", assemblyAiPollAttempts, transcriptId);
+        log.error("Job {}: Transcription polling timeout after {} attempts", jobId, assemblyAiPollAttempts);
         return null;
     }
 

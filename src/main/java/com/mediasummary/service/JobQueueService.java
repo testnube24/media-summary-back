@@ -61,9 +61,15 @@ public class JobQueueService {
 
     public String enqueueJob(Long jobId) {
         if (jobId == null) throw new IllegalArgumentException("jobId cannot be null");
-        Map<String, String> payload = Collections.singletonMap("jobId", jobId.toString());
-        RecordId id = redisTemplate.opsForStream().add(streamKey, payload);
-        return id != null ? id.getValue() : null;
+        try {
+            Map<String, String> payload = Collections.singletonMap("jobId", jobId.toString());
+            RecordId id = redisTemplate.opsForStream().add(streamKey, payload);
+            log.info("Job {} enqueued to Redis stream={}", jobId, streamKey);
+            return id != null ? id.getValue() : null;
+        } catch (Exception e) {
+            log.error("Failed to enqueue job {} to Redis - {}", jobId, e.getMessage());
+            throw new RuntimeException("Failed to enqueue job to Redis", e);
+        }
     }
 
     public QueueMessage readNext(Duration blockFor) {
@@ -98,7 +104,12 @@ public class JobQueueService {
 
     public void acknowledge(String recordId) {
         if (recordId == null || recordId.isBlank()) return;
-        redisTemplate.opsForStream().acknowledge(streamKey, consumerGroup, RecordId.of(recordId));
+        try {
+            redisTemplate.opsForStream().acknowledge(streamKey, consumerGroup, RecordId.of(recordId));
+            log.debug("Acknowledged message recordId={} in stream={}", recordId, streamKey);
+        } catch (Exception e) {
+            log.error("Failed to acknowledge message recordId={} - {}", recordId, e.getMessage());
+        }
     }
 
     @lombok.Value

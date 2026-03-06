@@ -1,0 +1,34 @@
+package com.mediasummary.config;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+@Configuration
+public class RedisConnectionChecker {
+
+    private static final Logger log = LoggerFactory.getLogger(RedisConnectionChecker.class);
+
+    private final StringRedisTemplate redisTemplate;
+
+    public RedisConnectionChecker(StringRedisTemplate redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    @Bean
+    public ApplicationRunner validateRedisConnection() {
+        return args -> {
+            try {
+                redisTemplate.getConnectionFactory().getConnection().ping();
+                log.info("Redis connected successfully.");
+
+            } catch (Exception e) {
+                log.error("Redis connection failed: {}", e.getMessage());
+                throw e;
+            }
+        };
+    }
+}
