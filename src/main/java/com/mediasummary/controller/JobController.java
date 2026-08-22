@@ -5,6 +5,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import javax.servlet.http.HttpServletRequest;
 import javax.validation.constraints.Email;
 import javax.validation.constraints.NotBlank;
 
@@ -26,6 +27,7 @@ import com.mediasummary.service.JobQueueService;
 import com.mediasummary.service.JobService;
 import com.mediasummary.service.ObjectStorageService;
 import com.mediasummary.service.ObjectStorageService.StoredObject;
+import com.mediasummary.service.UploadRateLimiter;
 
 import com.zaxxer.hikari.HikariDataSource;
 
@@ -50,6 +52,7 @@ public class JobController {
     private final JobQueueService queueService;
     private final ObjectStorageService objectStorageService;
     private final JdbcTemplate jdbcTemplate;
+    private final UploadRateLimiter rateLimiter;
 
     @Value("${app.max-file-size:52428800}")
     private long maxFileSizeBytes;
@@ -57,7 +60,18 @@ public class JobController {
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<Map<String, Object>> uploadAudio(
             @RequestParam("file") MultipartFile file,
-            @RequestParam("email") @NotBlank @Email String email) {
+            @RequestParam("email") @NotBlank @Email String email,
+            HttpServletRequest request) {
+
+        String clientIp = resolveClientIp(request);
+        UploadRateLimiter.Decision decision = rateLimiter.check(clientIp);
+        if (!decision.isAllowed()) {
+            long minutes = Math.max(1, decision.getRetryAfterSeconds() / 60);
+            log.warn("Upload rate limit exceeded for ip={}, email={}", clientIp, email);
+            return ResponseEntity.status(429)
+                    .header("Retry-After", String.valueOf(decision.getRetryAfterSeconds()))
+                    .body(Map.of("error", "Demasiadas solicitudes desde esta conexion. Intenta nuevamente en " + minutes + " minutos."));
+        }
 
         if (file == null || file.isEmpty()) {
             return ResponseEntity.badRequest().body(Map.of("error", "Archivo vacio"));
@@ -179,6 +193,18 @@ public class JobController {
             log.error("Error handling webhook", e);
             return ResponseEntity.status(500).body("error");
         }
+    }
+
+    /** Render sits behind a proxy, so the real client is the first hop in X-Forwarded-For. */
+    private String resolveClientIp(HttpServletRequest request) {
+        String forwarded = request.getHeader("X-Forwarded-For");
+        if (forwarded != null && !forwarded.isBlank()) {
+            String first = forwarded.split(",")[0].trim();
+            if (!first.isEmpty()) {
+                return first;
+            }
+        }
+        return request.getRemoteAddr();
     }
 
     private boolean isSupportedByAssemblyAi(MultipartFile file) {
