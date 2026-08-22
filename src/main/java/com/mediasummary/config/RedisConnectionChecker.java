@@ -21,13 +21,14 @@ public class RedisConnectionChecker {
     @Bean
     public ApplicationRunner validateRedisConnection() {
         return args -> {
-            try {
-                redisTemplate.getConnectionFactory().getConnection().ping();
+            try (var connection = redisTemplate.getConnectionFactory().getConnection()) {
+                connection.ping();
                 log.info("Redis connected successfully.");
 
             } catch (Exception e) {
-                log.error("Redis connection failed: {}", e.getMessage());
-                throw e;
+                // Do not abort startup: the API can still serve status/health from Postgres
+                // while the queue is unreachable. Uploads fail per-request until Redis is back.
+                log.error("Redis connection failed, queue is unavailable: {}", e.getMessage());
             }
         };
     }

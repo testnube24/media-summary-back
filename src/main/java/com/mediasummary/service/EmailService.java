@@ -20,7 +20,9 @@ public class EmailService {
 
     private final JavaMailSender mailSender;
 
-    @Value("${spring.mail.username}")
+    // Relays like Brevo/SendGrid use an API identifier as the SMTP username,
+    // which is not a valid From address. Default keeps Gmail working as-is.
+    @Value("${app.mail.from:${spring.mail.username}}")
     private String fromEmail;
 
     public void sendSummaryEmail(Job job, String emailSummary) {

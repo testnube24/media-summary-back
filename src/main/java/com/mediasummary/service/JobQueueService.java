@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.annotation.PostConstruct;
 
@@ -36,6 +37,12 @@ public class JobQueueService {
 
     @Value("${app.queue.consumer-name:${HOSTNAME:worker-1}}")
     private String consumerName;
+
+    @Value("${app.queue.failure-log-interval-ms:60000}")
+    private long failureLogIntervalMs;
+
+    private final AtomicLong consecutiveReadFailures = new AtomicLong();
+    private volatile long lastFailureLoggedAt;
 
     @PostConstruct
     public void ensureGroup() {
@@ -84,6 +91,8 @@ public class JobQueueService {
                     options,
                     StreamOffset.create(streamKey, ReadOffset.lastConsumed()));
 
+            noteReadSuccess();
+
             if (records == null || records.isEmpty()) {
                 return null;
             }
@@ -97,9 +106,51 @@ public class JobQueueService {
             Long jobId = Long.parseLong(jobIdVal.toString());
             return new QueueMessage(record.getId().getValue(), jobId);
         } catch (Exception e) {
-            log.error("Error reading queue message", e);
+            noteReadFailure(e);
             return null;
         }
+    }
+
+    private void noteReadSuccess() {
+        long failures = consecutiveReadFailures.getAndSet(0);
+        if (failures > 0) {
+            log.info("Queue reads recovered after {} consecutive failures", failures);
+        }
+    }
+
+    /**
+     * The worker polls every second, so an unreachable Redis would otherwise emit a stack
+     * trace per attempt forever. Log the first failure in full, then one summary line per
+     * interval until reads recover.
+     */
+    private void noteReadFailure(Exception e) {
+        if (isInterruption(e)) {
+            // Blocking XREADGROUP cancelled while the context shuts down; not a real failure.
+            log.debug("Queue read interrupted during shutdown");
+            return;
+        }
+
+        long failures = consecutiveReadFailures.incrementAndGet();
+        long now = System.currentTimeMillis();
+
+        if (failures == 1) {
+            lastFailureLoggedAt = now;
+            log.error("Error reading queue message; further failures are summarized every {} ms",
+                    failureLogIntervalMs, e);
+        } else if (now - lastFailureLoggedAt >= failureLogIntervalMs) {
+            lastFailureLoggedAt = now;
+            log.error("Still unable to read from the queue after {} consecutive attempts: {}",
+                    failures, e.getMessage());
+        }
+    }
+
+    private boolean isInterruption(Throwable e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof InterruptedException) {
+                return true;
+            }
+        }
+        return Thread.currentThread().isInterrupted();
     }
 
     public void acknowledge(String recordId) {

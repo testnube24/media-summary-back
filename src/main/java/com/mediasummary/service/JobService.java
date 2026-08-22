@@ -53,6 +53,9 @@ public class JobService {
     @Value("${groq.api.url}")
     private String groqApiUrl;
 
+    @Value("${groq.model}")
+    private String groqModel;
+
     private final OkHttpClient client = new OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
@@ -263,7 +266,7 @@ public class JobService {
                 "Texto: " + transcription.substring(0, Math.min(transcription.length(), 3000));
 
         JsonObject req = new JsonObject();
-        req.addProperty("model", "llama-3.1-8b-instant");
+        req.addProperty("model", groqModel);
 
         com.google.gson.JsonArray messages = new com.google.gson.JsonArray();
         JsonObject m = new JsonObject();
