@@ -2,6 +2,7 @@ package com.mediasummary.service;
 
 import java.io.IOException;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -300,29 +301,64 @@ public class JobService {
         }
     }
 
+    private static final int MINI_SUMMARY_MAX_CHARS = 500;
+
     private Summaries parseSummaries(String groqResponse) {
         String content = extractContent(groqResponse);
-        String[] parts = content.split("\\[SEPARATOR\\]|SHORT_SUMMARY:|LONG_SUMMARY:");
+        List<String> sections = splitSummarySections(content);
 
-        String miniSummary;
-        String emailSummary;
+        String shortSection;
+        String longSection;
 
-        if (parts.length >= 2) {
-            String shortPart = parts[1].trim();
-            miniSummary = shortPart.substring(0, Math.min(500, shortPart.length()));
-            emailSummary = parts.length > 2 ? parts[2].trim() : shortPart;
+        if (sections.size() >= 2) {
+            shortSection = sections.get(0);
+            longSection = sections.get(1);
+        } else if (sections.size() == 1) {
+            // The model answered in a single block; use it for both.
+            longSection = sections.get(0);
+            shortSection = longSection;
         } else {
-            String[] sentences = content.split("\\. ");
-            StringBuilder mini = new StringBuilder();
-            for (int i = 0; i < Math.min(2, sentences.length); i++) {
-                mini.append(sentences[i]).append(". ");
-            }
-            String miniStr = mini.toString().trim();
-            miniSummary = miniStr.substring(0, Math.min(500, miniStr.length()));
-            emailSummary = content;
+            longSection = content.trim();
+            shortSection = longSection;
         }
 
-        return new Summaries(miniSummary, emailSummary);
+        return new Summaries(truncateOnWordBoundary(shortSection), longSection);
+    }
+
+    /**
+     * The prompt asks for SHORT_SUMMARY, [SEPARATOR] and LONG_SUMMARY, but the model does not
+     * always emit all three. Splitting on the labels and the separator at once left an empty
+     * gap wherever two of them were adjacent, and that gap was taken as the long summary, so
+     * the email arrived with an empty body. Split on the separator, strip the labels, and
+     * discard whatever comes out blank.
+     */
+    private List<String> splitSummarySections(String content) {
+        String[] chunks = content.split("\\[SEPARATOR\\]");
+        if (chunks.length < 2) {
+            // No separator emitted: fall back to the label itself as the boundary.
+            chunks = content.split("(?i)LONG_SUMMARY\\s*:");
+        }
+
+        List<String> sections = new ArrayList<>();
+        for (String chunk : chunks) {
+            String cleaned = chunk.replaceAll("(?i)(SHORT_SUMMARY|LONG_SUMMARY)\\s*:", "").trim();
+            if (!cleaned.isEmpty()) {
+                sections.add(cleaned);
+            }
+        }
+        return sections;
+    }
+
+    private String truncateOnWordBoundary(String text) {
+        if (text.length() <= MINI_SUMMARY_MAX_CHARS) {
+            return text;
+        }
+        String cut = text.substring(0, MINI_SUMMARY_MAX_CHARS);
+        int lastSpace = cut.lastIndexOf(' ');
+        if (lastSpace > MINI_SUMMARY_MAX_CHARS / 2) {
+            cut = cut.substring(0, lastSpace);
+        }
+        return cut.trim() + "...";
     }
 
     private String pollTranscriptionResult(Long jobId, String transcriptId) throws IOException {
@@ -392,10 +428,18 @@ public class JobService {
         }
     }
 
+    /** Gson handles quotes and unicode escapes inside the content; manual scanning did not. */
     private String extractContent(String json) {
-        int start = json.indexOf("\"content\":\"") + 11;
-        int end = json.indexOf("\"", start);
-        return json.substring(start, end).replace("\\n", "\n").replace("\\\"", "\"");
+        try {
+            JsonObject obj = gson.fromJson(json, JsonObject.class);
+            return obj.getAsJsonArray("choices")
+                    .get(0).getAsJsonObject()
+                    .getAsJsonObject("message")
+                    .get("content").getAsString();
+        } catch (Exception e) {
+            log.error("Could not read the model response content: {}", e.getMessage());
+            return "";
+        }
     }
 
     @lombok.AllArgsConstructor

@@ -34,6 +34,11 @@ public class EmailService {
             helper.setFrom(fromEmail);
             helper.setSubject("📄 Resumen Profesional - Procesamiento #" + job.getId());
 
+            if (emailSummary == null || emailSummary.isBlank()) {
+                // Better to notice a hollow email in the logs than to have users receive one.
+                log.warn("Job {}: summary body is empty, the email will have no content", job.getId());
+            }
+
             String html = buildEmailTemplate(job, emailSummary);
             helper.setText(html, true);
 
