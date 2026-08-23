@@ -151,6 +151,7 @@ SPRING_MAIL_HOST, SPRING_MAIL_PORT, SPRING_MAIL_USERNAME, SPRING_MAIL_PASSWORD
 | `APP_CORS_ALLOWED_ORIGINS` | `*` | origen permitido del front |
 | `ASSEMBLYAI_WEBHOOK_URL` | vacío | ver advertencia abajo |
 | `APP_CLEANUP_DAYS` | `7` | retención de audios en Storage |
+| `SPRING_MAIL_CONNECTION_TIMEOUT_MS` | `10000` | corta envíos colgados; sin esto JavaMail bloquea para siempre |
 
 Notas de proveedor:
 
