@@ -57,6 +57,12 @@ public class JobService {
     @Value("${groq.model}")
     private String groqModel;
 
+    @Value("${groq.max-tokens:4000}")
+    private int groqMaxTokens;
+
+    @Value("${groq.reasoning-effort:low}")
+    private String groqReasoningEffort;
+
     private final OkHttpClient client = new OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
@@ -277,7 +283,12 @@ public class JobService {
         req.add("messages", messages);
 
         req.addProperty("temperature", 0.3);
-        req.addProperty("max_tokens", 800);
+        // A reasoning model spends this budget thinking before it answers and returns an
+        // empty content if it runs out first, so the limit has to cover both parts.
+        req.addProperty("max_tokens", groqMaxTokens);
+        if (groqReasoningEffort != null && !groqReasoningEffort.isBlank()) {
+            req.addProperty("reasoning_effort", groqReasoningEffort.trim());
+        }
 
         RequestBody body = RequestBody.create(gson.toJson(req), MediaType.parse("application/json"));
         Request request = new Request.Builder()
@@ -432,14 +443,39 @@ public class JobService {
     private String extractContent(String json) {
         try {
             JsonObject obj = gson.fromJson(json, JsonObject.class);
-            return obj.getAsJsonArray("choices")
-                    .get(0).getAsJsonObject()
-                    .getAsJsonObject("message")
-                    .get("content").getAsString();
+            JsonObject choice = obj.getAsJsonArray("choices").get(0).getAsJsonObject();
+            com.google.gson.JsonElement content = choice.getAsJsonObject("message").get("content");
+
+            String text = content == null || content.isJsonNull() ? "" : content.getAsString();
+
+            if (text.isBlank()) {
+                // A successful call that produced nothing is otherwise invisible: the request
+                // returns 200 and the summary silently comes out empty. A reasoning model that
+                // exhausts its budget before answering looks exactly like this.
+                log.error("Model returned no content (finish_reason={}, {}). "
+                        + "Raise GROQ_MAX_TOKENS or lower GROQ_REASONING_EFFORT.",
+                        readMember(choice, "finish_reason"), describeUsage(obj));
+            }
+
+            return text;
         } catch (Exception e) {
             log.error("Could not read the model response content: {}", e.getMessage());
             return "";
         }
+    }
+
+    private String describeUsage(JsonObject root) {
+        JsonObject usage = root.getAsJsonObject("usage");
+        if (usage == null) {
+            return "usage unavailable";
+        }
+        return "completion_tokens=" + readMember(usage, "completion_tokens")
+                + " total_tokens=" + readMember(usage, "total_tokens");
+    }
+
+    private String readMember(JsonObject object, String member) {
+        com.google.gson.JsonElement value = object == null ? null : object.get(member);
+        return value == null || value.isJsonNull() ? "unknown" : value.getAsString();
     }
 
     @lombok.AllArgsConstructor
