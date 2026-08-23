@@ -12,6 +12,7 @@ import org.springframework.stereotype.Service;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.mediasummary.model.Job;
+import com.mediasummary.model.SpeakerSummary;
 import com.mediasummary.repository.JobRepository;
 
 import lombok.RequiredArgsConstructor;
@@ -48,6 +49,9 @@ public class JobService {
     @Value("${assemblyai.webhook.url:}")
     private String assemblyAiWebhookUrl;
 
+    @Value("${assemblyai.speaker-labels:true}")
+    private boolean assemblyAiSpeakerLabels;
+
     @Value("${groq.api.key}")
     private String groqApiKey;
 
@@ -62,6 +66,9 @@ public class JobService {
 
     @Value("${groq.reasoning-effort:low}")
     private String groqReasoningEffort;
+
+    @Value("${groq.transcript-chars:60000}")
+    private int groqTranscriptChars;
 
     private final OkHttpClient client = new OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)
@@ -118,7 +125,7 @@ public class JobService {
             jobRepository.updateProgress(jobId, 100, "completed");
 
             Job completedJob = jobRepository.findById(jobId);
-            emailService.sendSummaryEmail(completedJob, summaries.getEmailSummary());
+            emailService.sendSummaryEmail(completedJob, summaries.getEmailSummary(), summaries.getSpeakers());
             log.info("Job {} completed in {}ms", jobId, processingTime);
         } catch (Exception e) {
             log.error("Error processing job {}", jobId, e);
@@ -150,6 +157,11 @@ public class JobService {
             if (!mm.isEmpty()) modelsArray.add(mm);
         }
         transcriptReq.add("speech_models", modelsArray);
+
+        if (assemblyAiSpeakerLabels) {
+            // Turns the flat text into an utterances array tagged by speaker.
+            transcriptReq.addProperty("speaker_labels", true);
+        }
 
         if (assemblyAiWebhookUrl != null && !assemblyAiWebhookUrl.isBlank()) {
             transcriptReq.addProperty("webhook_url", assemblyAiWebhookUrl);
@@ -230,7 +242,8 @@ public class JobService {
 
                 jobRepository.updateCompleted(job.getId(), "COMPLETED", summaries.getMiniSummary(), processingTime);
                 jobRepository.updateProgress(job.getId(), 100, "completed");
-                emailService.sendSummaryEmail(jobRepository.findById(job.getId()), summaries.getEmailSummary());
+                emailService.sendSummaryEmail(jobRepository.findById(job.getId()),
+                        summaries.getEmailSummary(), summaries.getSpeakers());
             } else if ("error".equalsIgnoreCase(status)) {
                 String msg = payload.get("error") != null ? payload.get("error").toString() : "AssemblyAI reported error";
                 jobRepository.updateStatus(job.getId(), "ERROR", msg);
@@ -253,8 +266,9 @@ public class JobService {
             try (Response resp = client.newCall(req).execute()) {
                 String body = resp.body() != null ? resp.body().string() : null;
                 JsonObject obj = gson.fromJson(body, JsonObject.class);
-                if (obj != null && obj.has("text") && !obj.get("text").isJsonNull()) {
-                    return obj.get("text").getAsString();
+                String transcript = readTranscript(obj);
+                if (transcript != null && !transcript.isBlank()) {
+                    return transcript;
                 }
             }
         } catch (Exception e) {
@@ -266,14 +280,21 @@ public class JobService {
     private Summaries generateSummaries(String transcription) throws IOException {
         log.info("Generating summaries with Groq API");
         
-        String prompt = "Analiza este texto y genera DOS resumenes en espanol, separados por [SEPARATOR]. " +
-                "No uses ingles. Usa un tono profesional y claro.\n\n" +
-                "SHORT_SUMMARY: Maximo 50 palabras en espanol, resumen ejecutivo para vista previa.\n" +
-                "LONG_SUMMARY: 250-300 palabras en espanol, resumen profesional detallado para email.\n\n" +
-                "Texto: " + transcription.substring(0, Math.min(transcription.length(), 3000));
+        String prompt = "Analiza esta transcripcion y responde en espanol, nunca en ingles, "
+                + "con un tono profesional y claro.\n\n"
+                + "mini_summary: maximo 50 palabras, resumen ejecutivo para vista previa.\n"
+                + "full_summary: 250-300 palabras, resumen detallado para el correo.\n"
+                + "speakers: un elemento por participante, con lo que aporto cada uno. "
+                + "Si la transcripcion viene etiquetada como 'Participante A', 'Participante B', "
+                + "usa esas mismas etiquetas como nombre. Si solo hay una persona, devuelve un "
+                + "unico elemento. Si no se distinguen participantes, devuelve la lista vacia.\n\n"
+                + "Transcripcion:\n" + truncateTranscript(transcription);
 
         JsonObject req = new JsonObject();
         req.addProperty("model", groqModel);
+        // Constrained decoding: the model cannot answer outside this shape, which removes the
+        // guesswork of splitting free-form text into sections.
+        req.add("response_format", summaryResponseFormat());
 
         com.google.gson.JsonArray messages = new com.google.gson.JsonArray();
         JsonObject m = new JsonObject();
@@ -312,52 +333,126 @@ public class JobService {
         }
     }
 
-    private static final int MINI_SUMMARY_MAX_CHARS = 500;
-
-    private Summaries parseSummaries(String groqResponse) {
-        String content = extractContent(groqResponse);
-        List<String> sections = splitSummarySections(content);
-
-        String shortSection;
-        String longSection;
-
-        if (sections.size() >= 2) {
-            shortSection = sections.get(0);
-            longSection = sections.get(1);
-        } else if (sections.size() == 1) {
-            // The model answered in a single block; use it for both.
-            longSection = sections.get(0);
-            shortSection = longSection;
-        } else {
-            longSection = content.trim();
-            shortSection = longSection;
+    private String truncateTranscript(String transcription) {
+        if (transcription == null) {
+            return "";
         }
-
-        return new Summaries(truncateOnWordBoundary(shortSection), longSection);
+        if (transcription.length() <= groqTranscriptChars) {
+            return transcription;
+        }
+        log.warn("Transcript is {} characters, only the first {} are summarized",
+                transcription.length(), groqTranscriptChars);
+        return transcription.substring(0, groqTranscriptChars);
     }
 
+    /** JSON schema for the answer. Strict mode requires every field listed and no extras. */
+    private JsonObject summaryResponseFormat() {
+        JsonObject stringField = new JsonObject();
+        stringField.addProperty("type", "string");
+
+        JsonObject speakerProps = new JsonObject();
+        speakerProps.add("speaker", stringField.deepCopy());
+        speakerProps.add("summary", stringField.deepCopy());
+
+        com.google.gson.JsonArray speakerRequired = new com.google.gson.JsonArray();
+        speakerRequired.add("speaker");
+        speakerRequired.add("summary");
+
+        JsonObject speakerItem = new JsonObject();
+        speakerItem.addProperty("type", "object");
+        speakerItem.add("properties", speakerProps);
+        speakerItem.add("required", speakerRequired);
+        speakerItem.addProperty("additionalProperties", false);
+
+        JsonObject speakers = new JsonObject();
+        speakers.addProperty("type", "array");
+        speakers.add("items", speakerItem);
+
+        JsonObject properties = new JsonObject();
+        properties.add("mini_summary", stringField.deepCopy());
+        properties.add("full_summary", stringField.deepCopy());
+        properties.add("speakers", speakers);
+
+        com.google.gson.JsonArray required = new com.google.gson.JsonArray();
+        required.add("mini_summary");
+        required.add("full_summary");
+        required.add("speakers");
+
+        JsonObject schema = new JsonObject();
+        schema.addProperty("type", "object");
+        schema.add("properties", properties);
+        schema.add("required", required);
+        schema.addProperty("additionalProperties", false);
+
+        JsonObject jsonSchema = new JsonObject();
+        jsonSchema.addProperty("name", "media_summary");
+        jsonSchema.addProperty("strict", true);
+        jsonSchema.add("schema", schema);
+
+        JsonObject responseFormat = new JsonObject();
+        responseFormat.addProperty("type", "json_schema");
+        responseFormat.add("json_schema", jsonSchema);
+        return responseFormat;
+    }
+
+    private static final int MINI_SUMMARY_MAX_CHARS = 500;
+
     /**
-     * The prompt asks for SHORT_SUMMARY, [SEPARATOR] and LONG_SUMMARY, but the model does not
-     * always emit all three. Splitting on the labels and the separator at once left an empty
-     * gap wherever two of them were adjacent, and that gap was taken as the long summary, so
-     * the email arrived with an empty body. Split on the separator, strip the labels, and
-     * discard whatever comes out blank.
+     * The answer is constrained to a JSON schema, so it is read as data rather than pulled
+     * apart with delimiters. Anything unexpected degrades to the raw content instead of
+     * throwing, since a job that reaches this point already paid for transcription.
      */
-    private List<String> splitSummarySections(String content) {
-        String[] chunks = content.split("\\[SEPARATOR\\]");
-        if (chunks.length < 2) {
-            // No separator emitted: fall back to the label itself as the boundary.
-            chunks = content.split("(?i)LONG_SUMMARY\\s*:");
+    private Summaries parseSummaries(String groqResponse) {
+        String content = extractContent(groqResponse);
+        if (content.isBlank()) {
+            return new Summaries("", "", new ArrayList<>());
         }
 
-        List<String> sections = new ArrayList<>();
-        for (String chunk : chunks) {
-            String cleaned = chunk.replaceAll("(?i)(SHORT_SUMMARY|LONG_SUMMARY)\\s*:", "").trim();
-            if (!cleaned.isEmpty()) {
-                sections.add(cleaned);
+        try {
+            JsonObject answer = gson.fromJson(content, JsonObject.class);
+
+            String mini = readText(answer, "mini_summary");
+            String full = readText(answer, "full_summary");
+            List<SpeakerSummary> speakers = readSpeakers(answer);
+
+            if (full.isBlank()) {
+                full = mini;
+            }
+            if (mini.isBlank()) {
+                mini = full;
+            }
+
+            return new Summaries(truncateOnWordBoundary(mini), full, speakers);
+        } catch (Exception e) {
+            log.warn("Model answer was not the expected JSON ({}), using it as plain text", e.getMessage());
+            return new Summaries(truncateOnWordBoundary(content.trim()), content.trim(), new ArrayList<>());
+        }
+    }
+
+    private List<SpeakerSummary> readSpeakers(JsonObject answer) {
+        List<SpeakerSummary> speakers = new ArrayList<>();
+        com.google.gson.JsonArray array = answer.getAsJsonArray("speakers");
+        if (array == null) {
+            return speakers;
+        }
+
+        for (com.google.gson.JsonElement element : array) {
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject speaker = element.getAsJsonObject();
+            String name = readText(speaker, "speaker");
+            String summary = readText(speaker, "summary");
+            if (!name.isBlank() && !summary.isBlank()) {
+                speakers.add(new SpeakerSummary(name, summary));
             }
         }
-        return sections;
+        return speakers;
+    }
+
+    private String readText(JsonObject object, String member) {
+        com.google.gson.JsonElement value = object == null ? null : object.get(member);
+        return value == null || value.isJsonNull() ? "" : value.getAsString().trim();
     }
 
     private String truncateOnWordBoundary(String text) {
@@ -433,10 +528,44 @@ public class JobService {
     private String parseTranscriptionText(String json) {
         try {
             JsonObject obj = gson.fromJson(json, JsonObject.class);
-            return obj.has("text") ? obj.get("text").getAsString() : null;
+            return readTranscript(obj);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * Prefers the diarized utterances so the model can tell the participants apart. Falls back
+     * to the flat text when diarization is off or the audio has a single speaker.
+     */
+    private String readTranscript(JsonObject transcript) {
+        if (transcript == null) {
+            return null;
+        }
+
+        com.google.gson.JsonArray utterances = transcript.getAsJsonArray("utterances");
+        if (utterances != null && utterances.size() > 0) {
+            StringBuilder sb = new StringBuilder();
+            for (com.google.gson.JsonElement element : utterances) {
+                JsonObject utterance = element.getAsJsonObject();
+                String speaker = utterance.has("speaker") && !utterance.get("speaker").isJsonNull()
+                        ? utterance.get("speaker").getAsString()
+                        : "?";
+                String text = utterance.has("text") && !utterance.get("text").isJsonNull()
+                        ? utterance.get("text").getAsString()
+                        : "";
+                if (!text.isBlank()) {
+                    sb.append("Participante ").append(speaker).append(": ").append(text).append('\n');
+                }
+            }
+            if (sb.length() > 0) {
+                return sb.toString().trim();
+            }
+        }
+
+        return transcript.has("text") && !transcript.get("text").isJsonNull()
+                ? transcript.get("text").getAsString()
+                : null;
     }
 
     /** Gson handles quotes and unicode escapes inside the content; manual scanning did not. */
@@ -483,5 +612,6 @@ public class JobService {
     private static class Summaries {
         private final String miniSummary;
         private final String emailSummary;
+        private final List<SpeakerSummary> speakers;
     }
 }

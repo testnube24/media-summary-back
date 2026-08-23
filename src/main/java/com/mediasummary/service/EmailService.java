@@ -8,10 +8,12 @@ import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.stereotype.Service;
 
 import com.mediasummary.model.Job;
+import com.mediasummary.model.SpeakerSummary;
 
 import javax.mail.MessagingException;
 import javax.mail.internet.MimeMessage;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 
 @Service
 @RequiredArgsConstructor
@@ -25,7 +27,7 @@ public class EmailService {
     @Value("${app.mail.from:${spring.mail.username}}")
     private String fromEmail;
 
-    public void sendSummaryEmail(Job job, String emailSummary) {
+    public void sendSummaryEmail(Job job, String emailSummary, List<SpeakerSummary> speakers) {
         try {
             MimeMessage message = mailSender.createMimeMessage();
             MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
@@ -39,11 +41,12 @@ public class EmailService {
                 log.warn("Job {}: summary body is empty, the email will have no content", job.getId());
             }
 
-            String html = buildEmailTemplate(job, emailSummary);
+            String html = buildEmailTemplate(job, emailSummary, speakers);
             helper.setText(html, true);
 
             mailSender.send(message);
-            log.info("Job {}: Summary email sent successfully to {}", job.getId(), job.getEmail());
+            log.info("Job {}: Summary email sent successfully to {} ({} participants)",
+                    job.getId(), job.getEmail(), speakers == null ? 0 : speakers.size());
 
         } catch (Exception e) {
             log.error("Job {}: Failed to send summary email to {} - {}", job.getId(), job.getEmail(), e.getMessage());
@@ -60,7 +63,7 @@ public class EmailService {
             helper.setSubject("❌ Error en procesamiento");
 
             String html = "<h2>Error en procesamiento</h2>" +
-                    "<p>Lo sentimos, hubo un error: " + errorMessage + "</p>" +
+                    "<p>Lo sentimos, hubo un error: " + escapeHtml(errorMessage) + "</p>" +
                     "<p>Por favor intenta nuevamente.</p>";
 
             helper.setText(html, true);
@@ -72,7 +75,7 @@ public class EmailService {
         }
     }
 
-    private String buildEmailTemplate(Job job, String emailSummary) {
+    private String buildEmailTemplate(Job job, String emailSummary, List<SpeakerSummary> speakers) {
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
 
         return "<!DOCTYPE html>" +
@@ -83,6 +86,10 @@ public class EmailService {
                 ".header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; }" +
                 ".content { background: #f9f9f9; padding: 30px; }" +
                 ".summary-box { background: white; padding: 20px; border-left: 4px solid #667eea; margin: 20px 0; }" +
+                ".speaker { margin: 0 0 18px 0; }" +
+                ".speaker:last-child { margin-bottom: 0; }" +
+                ".speaker-name { color: #667eea; font-weight: bold; margin: 0 0 4px 0; }" +
+                ".speaker-text { margin: 0; }" +
                 ".footer { text-align: center; color: #666; font-size: 12px; margin-top: 30px; }" +
                 "</style>" +
                 "</head>" +
@@ -94,8 +101,9 @@ public class EmailService {
                 "<div class='content'>" +
                 "<div class='summary-box'>" +
                 "<h2>📋 Resumen Ejecutivo</h2>" +
-                "<p>" + emailSummary.replace("\n", "<br>") + "</p>" +
+                "<p>" + escapeHtml(emailSummary).replace("\n", "<br>") + "</p>" +
                 "</div>" +
+                buildSpeakersSection(speakers) +
                 "<div class='footer'>" +
                 "<p>Procesado en " + (job.getProcessingTimeMs() / 1000) + " segundos</p>" +
                 "<p>© Audio Summary App</p>" +
@@ -103,5 +111,37 @@ public class EmailService {
                 "</div>" +
                 "</body>" +
                 "</html>";
+    }
+
+    /** Omitted entirely when the audio had no distinguishable participants. */
+    private String buildSpeakersSection(List<SpeakerSummary> speakers) {
+        if (speakers == null || speakers.isEmpty()) {
+            return "";
+        }
+
+        StringBuilder section = new StringBuilder()
+                .append("<div class='summary-box'>")
+                .append("<h2>👥 Participantes</h2>");
+
+        for (SpeakerSummary speaker : speakers) {
+            section.append("<div class='speaker'>")
+                   .append("<p class='speaker-name'>").append(escapeHtml(speaker.getSpeaker())).append("</p>")
+                   .append("<p class='speaker-text'>")
+                   .append(escapeHtml(speaker.getSummary()).replace("\n", "<br>"))
+                   .append("</p>")
+                   .append("</div>");
+        }
+
+        return section.append("</div>").toString();
+    }
+
+    /** The summaries come from a model, so they are text and must not be read as markup. */
+    private String escapeHtml(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.replace("&", "&amp;")
+                   .replace("<", "&lt;")
+                   .replace(">", "&gt;");
     }
 }
