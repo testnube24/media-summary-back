@@ -1,6 +1,7 @@
 package com.mediasummary.service;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
@@ -17,6 +18,9 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
+import okio.BufferedSink;
+import okio.Okio;
+import okio.Source;
 
 @Service
 @Slf4j
@@ -49,18 +53,39 @@ public class SupabaseStorageService implements ObjectStorageService {
             String objectPath = buildObjectPath(file.getOriginalFilename());
             String uploadUrl = String.format("%s/storage/v1/object/%s/%s", trimTrailingSlash(supabaseUrl), bucket, objectPath);
 
-            byte[] bytes = file.getBytes();
-            String contentType = file.getContentType();
-            if (contentType == null || contentType.isBlank()) {
-                contentType = "application/octet-stream";
-            }
+            String detected = file.getContentType();
+            final String contentType = detected == null || detected.isBlank()
+                    ? "application/octet-stream"
+                    : detected;
+
+            // Stream straight from the multipart temp file. Reading it into a byte[] first
+            // costs about twice the file size in heap while the buffer grows, which is more
+            // than the container has for anything near the configured size limit.
+            RequestBody payload = new RequestBody() {
+                @Override
+                public MediaType contentType() {
+                    return MediaType.parse(contentType);
+                }
+
+                @Override
+                public long contentLength() {
+                    return file.getSize();
+                }
+
+                @Override
+                public void writeTo(BufferedSink sink) throws IOException {
+                    try (InputStream in = file.getInputStream(); Source source = Okio.source(in)) {
+                        sink.writeAll(source);
+                    }
+                }
+            };
 
             Request request = new Request.Builder()
                     .url(uploadUrl)
                     .header("Authorization", "Bearer " + supabaseServiceKey)
                     .header("apikey", supabaseServiceKey)
                     .header("x-upsert", "true")
-                    .put(RequestBody.create(bytes, MediaType.parse(contentType)))
+                    .put(payload)
                     .build();
 
             try (Response response = client.newCall(request).execute()) {
