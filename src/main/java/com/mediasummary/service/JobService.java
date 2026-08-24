@@ -61,13 +61,15 @@ public class JobService {
     @Value("${groq.model}")
     private String groqModel;
 
-    @Value("${groq.max-tokens:4000}")
+    @Value("${groq.max-tokens:3000}")
     private int groqMaxTokens;
 
     @Value("${groq.reasoning-effort:low}")
     private String groqReasoningEffort;
 
-    @Value("${groq.transcript-chars:60000}")
+    private static final int GROQ_SIZE_RETRIES = 3;
+
+    @Value("${groq.transcript-chars:14000}")
     private int groqTranscriptChars;
 
     private final OkHttpClient client = new OkHttpClient.Builder()
@@ -277,9 +279,31 @@ public class JobService {
         return null;
     }
 
+    /**
+     * The free tier caps tokens per minute, and both the transcript and max_tokens count
+     * against it, so a long enough audio is rejected outright with a 413. Halve the transcript
+     * and try again rather than failing a job that already paid for its transcription.
+     */
     private Summaries generateSummaries(String transcription) throws IOException {
+        int chars = groqTranscriptChars;
+
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return requestSummaries(transcription, chars);
+            } catch (RequestTooLargeException e) {
+                if (attempt >= GROQ_SIZE_RETRIES) {
+                    throw new IOException("Groq rejected the request as too large after "
+                            + attempt + " attempts: " + e.getMessage(), e);
+                }
+                chars = Math.max(1000, chars / 2);
+                log.warn("Groq rejected the request as too large, retrying with {} characters", chars);
+            }
+        }
+    }
+
+    private Summaries requestSummaries(String transcription, int maxChars) throws IOException {
         log.info("Generating summaries with Groq API");
-        
+
         String prompt = "Analiza esta transcripcion y responde en espanol, nunca en ingles, "
                 + "con un tono profesional y claro.\n\n"
                 + "mini_summary: maximo 50 palabras, resumen ejecutivo para vista previa.\n"
@@ -288,7 +312,7 @@ public class JobService {
                 + "Si la transcripcion viene etiquetada como 'Participante A', 'Participante B', "
                 + "usa esas mismas etiquetas como nombre. Si solo hay una persona, devuelve un "
                 + "unico elemento. Si no se distinguen participantes, devuelve la lista vacia.\n\n"
-                + "Transcripcion:\n" + truncateTranscript(transcription);
+                + "Transcripcion:\n" + truncateTranscript(transcription, maxChars);
 
         JsonObject req = new JsonObject();
         req.addProperty("model", groqModel);
@@ -322,27 +346,51 @@ public class JobService {
         try (Response response = client.newCall(request).execute()) {
             String responseBody = response.body() != null ? response.body().string() : null;
             if (!response.isSuccessful()) {
+                if (isRequestTooLarge(response.code(), responseBody)) {
+                    // Expected for a long transcript, and the caller shrinks and tries again.
+                    log.warn("Groq rejected the request size. HTTP {}", response.code());
+                    throw new RequestTooLargeException(responseBody);
+                }
                 log.error("Groq API request failed. HTTP {} - {}", response.code(), responseBody);
                 throw new IOException("Groq API error: " + response.code() + " body: " + responseBody);
             }
             log.info("Groq API request successful");
             return parseSummaries(responseBody);
+        } catch (RequestTooLargeException e) {
+            throw e;
         } catch (IOException e) {
             log.error("Failed to connect to Groq API - {}", e.getMessage());
             throw e;
         }
     }
 
-    private String truncateTranscript(String transcription) {
+    /**
+     * A 413 here means the request alone exceeds the per-minute token allowance, which shrinking
+     * the transcript can fix. A 429 means the allowance is spent for now, which it cannot.
+     */
+    private boolean isRequestTooLarge(int statusCode, String body) {
+        return statusCode == 413 || (body != null && body.contains("Request too large"));
+    }
+
+    private String truncateTranscript(String transcription, int maxChars) {
         if (transcription == null) {
             return "";
         }
-        if (transcription.length() <= groqTranscriptChars) {
+        if (transcription.length() <= maxChars) {
             return transcription;
         }
         log.warn("Transcript is {} characters, only the first {} are summarized",
-                transcription.length(), groqTranscriptChars);
-        return transcription.substring(0, groqTranscriptChars);
+                transcription.length(), maxChars);
+        return transcription.substring(0, maxChars);
+    }
+
+    /** Signals that the request has to shrink, as opposed to a plain API failure. */
+    private static class RequestTooLargeException extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        RequestTooLargeException(String message) {
+            super(message);
+        }
     }
 
     /** JSON schema for the answer. Strict mode requires every field listed and no extras. */
