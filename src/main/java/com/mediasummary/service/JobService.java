@@ -69,6 +69,9 @@ public class JobService {
 
     private static final int GROQ_SIZE_RETRIES = 3;
 
+    @Value("${app.transcript-log-chars:400}")
+    private int transcriptLogChars;
+
     @Value("${groq.transcript-chars:14000}")
     private int groqTranscriptChars;
 
@@ -118,6 +121,8 @@ public class JobService {
                 log.info("Transcription still pending for job {}. Keeping PROCESSING.", jobId);
                 return;
             }
+
+            logTranscriptSample(jobId, transcription);
 
             jobRepository.updateProgress(jobId, 75, "summarizing");
             Summaries summaries = generateSummaries(transcription);
@@ -309,13 +314,17 @@ public class JobService {
                 + "mini_summary: maximo 50 palabras, resumen ejecutivo para vista previa.\n"
                 + "full_summary: 250-300 palabras, resumen detallado para el correo.\n"
                 + "speakers: un elemento por participante, con lo que aporto cada uno.\n"
-                + "En el campo 'speaker' pon el nombre real de la persona cuando la propia "
-                + "conversacion lo revele: se presenta, alguien la saluda o la menciona por su "
-                + "nombre, o se despide firmando. Usa solo el nombre, sin la etiqueta.\n"
-                + "Si el nombre de esa persona no aparece dicho en la transcripcion, deja su "
-                + "etiqueta generica tal cual ('Participante A'). Nunca inventes un nombre, no "
-                + "lo deduzcas del tema de conversacion y no se lo asignes por parecido: es "
-                + "preferible la etiqueta generica antes que un nombre equivocado.\n"
+                + "Cada linea de la transcripcion empieza con la voz que habla entre corchetes: "
+                + "[A], [B], [C]. Son etiquetas anonimas, no nombres.\n"
+                + "Antes de responder, averigua a que persona corresponde cada letra. Las pistas "
+                + "estan en lo que se dice: alguien se presenta ('soy Juan'), lo saludan o lo "
+                + "interpelan ('Juan, que opinas?') y responde en la linea siguiente, o le "
+                + "agradecen despues de que hablo ('gracias Juan'). Cruza esas menciones con el "
+                + "turno de palabra para saber quien es quien.\n"
+                + "En el campo 'speaker' pon el nombre de la persona si lograste identificarlo. "
+                + "Si no, pon 'Participante ' seguido de su letra, por ejemplo 'Participante A'.\n"
+                + "Nunca inventes un nombre ni lo deduzcas del tema de conversacion: es preferible "
+                + "la etiqueta anonima antes que un nombre equivocado.\n"
                 + "Si solo hay una persona, devuelve un unico elemento. Si no se distinguen "
                 + "participantes, devuelve la lista vacia.\n\n"
                 + "Transcripcion:\n" + truncateTranscript(transcription, maxChars);
@@ -376,6 +385,23 @@ public class JobService {
      */
     private boolean isRequestTooLarge(int statusCode, String body) {
         return statusCode == 413 || (body != null && body.contains("Request too large"));
+    }
+
+    /**
+     * Whether a participant can be named at all depends on someone saying their name, which is
+     * only visible in the transcript. Logging the opening lines makes the difference between
+     * "the model ignored the instruction" and "nobody introduced themselves" observable.
+     *
+     * This puts conversation content in the logs, so set the limit to 0 to turn it off.
+     */
+    private void logTranscriptSample(Long jobId, String transcription) {
+        if (transcriptLogChars <= 0 || transcription == null || transcription.isBlank()) {
+            return;
+        }
+        String sample = transcription.length() <= transcriptLogChars
+                ? transcription
+                : transcription.substring(0, transcriptLogChars) + "...";
+        log.info("Job {}: transcript starts with: {}", jobId, sample.replace('\n', '|'));
     }
 
     private String truncateTranscript(String transcription, int maxChars) {
@@ -609,7 +635,9 @@ public class JobService {
                         ? utterance.get("text").getAsString()
                         : "";
                 if (!text.isBlank()) {
-                    sb.append("Participante ").append(speaker).append(": ").append(text).append('\n');
+                    // Just the letter: writing "Participante A" here made the model echo that
+                    // label back instead of looking for the person's actual name.
+                    sb.append('[').append(speaker).append("] ").append(text).append('\n');
                 }
             }
             if (sb.length() > 0) {
