@@ -308,10 +308,16 @@ public class JobService {
                 + "con un tono profesional y claro.\n\n"
                 + "mini_summary: maximo 50 palabras, resumen ejecutivo para vista previa.\n"
                 + "full_summary: 250-300 palabras, resumen detallado para el correo.\n"
-                + "speakers: un elemento por participante, con lo que aporto cada uno. "
-                + "Si la transcripcion viene etiquetada como 'Participante A', 'Participante B', "
-                + "usa esas mismas etiquetas como nombre. Si solo hay una persona, devuelve un "
-                + "unico elemento. Si no se distinguen participantes, devuelve la lista vacia.\n\n"
+                + "speakers: un elemento por participante, con lo que aporto cada uno.\n"
+                + "En el campo 'speaker' pon el nombre real de la persona cuando la propia "
+                + "conversacion lo revele: se presenta, alguien la saluda o la menciona por su "
+                + "nombre, o se despide firmando. Usa solo el nombre, sin la etiqueta.\n"
+                + "Si el nombre de esa persona no aparece dicho en la transcripcion, deja su "
+                + "etiqueta generica tal cual ('Participante A'). Nunca inventes un nombre, no "
+                + "lo deduzcas del tema de conversacion y no se lo asignes por parecido: es "
+                + "preferible la etiqueta generica antes que un nombre equivocado.\n"
+                + "Si solo hay una persona, devuelve un unico elemento. Si no se distinguen "
+                + "participantes, devuelve la lista vacia.\n\n"
                 + "Transcripcion:\n" + truncateTranscript(transcription, maxChars);
 
         JsonObject req = new JsonObject();
